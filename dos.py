@@ -10,26 +10,36 @@ import os
 import argparse
 from pathlib import Path
 import time
+import json
+import matplotlib.pyplot as plt
 
 class PixelArtDataset(Dataset):
-    def __init__(self, root_dir, csv_file, transform=None, max_frames=60):
-        self.root_dir = root_dir
-        self.data = pd.read_csv(csv_file)
+    def __init__(self, root_dir, transform=None, max_frames=60):
+        self.root_dir = Path(root_dir)
         self.transform = transform
         self.max_frames = max_frames
+        self.animations = self._load_animations()
+    
+    def _load_animations(self):
+        return [d for d in self.root_dir.iterdir() if d.is_dir()]
     
     def __len__(self):
-        return len(self.data)
+        return len(self.animations)
     
     def __getitem__(self, idx):
-        anim_name = self.data.iloc[idx]['animation_name']
-        label = self.data.iloc[idx]['label']
+        anim_dir = self.animations[idx]
+        
+        with open(anim_dir / "metadata.json", "r") as f:
+            metadata = json.load(f)
+        
+        attributes = metadata["attributes"]
+        description = metadata["description"]
         
         frames = []
         for i in range(self.max_frames):
-            img_path = os.path.join(self.root_dir, anim_name, f"frame_{i:04d}.png")
-            if os.path.exists(img_path):
-                image = Image.open(img_path).convert('RGB')
+            img_path = anim_dir / f"frame_{i:04d}.png"
+            if img_path.exists():
+                image = Image.open(img_path).convert('RGBA')
                 if self.transform:
                     image = self.transform(image)
                 frames.append(image)
@@ -41,7 +51,31 @@ class PixelArtDataset(Dataset):
         elif len(frames) > self.max_frames:
             frames = frames[:self.max_frames]
         
-        return torch.stack(frames), label
+        return torch.stack(frames), attributes, description
+
+def visualize_batch(batch_frames, batch_num):
+    batch_frames = batch_frames.cpu().numpy()
+    fig, axes = plt.subplots(2, 4, figsize=(20, 10))
+    for i, ax in enumerate(axes.flat):
+        if i < batch_frames.shape[0]:
+            frame = (batch_frames[i] * 255).astype(np.uint8).transpose(1, 2, 0)
+            ax.imshow(frame)
+            ax.axis('off')
+    plt.tight_layout()
+    plt.savefig(f'batch_visualization_{batch_num}.png')
+    plt.close()
+
+def print_dataset_info(dataset):
+    print(f"Total number of animations: {len(dataset)}")
+    print("First 5 animation folders:")
+    for anim_dir in dataset.animations[:5]:
+        print(f"  - {anim_dir}")
+        print(f"    Number of frames: {len(list(anim_dir.glob('frame_*.png')))}")
+        with open(anim_dir / "metadata.json", "r") as f:
+            metadata = json.load(f)
+        print(f"    Attributes: {metadata['attributes']}")
+        print(f"    Description: {metadata['description']}")
+    print("\n")
 
 class TextToAnimationCNN(nn.Module):
     def __init__(self, text_embed_size, hidden_size, max_frames, frame_size):
@@ -62,8 +96,8 @@ class TextToAnimationCNN(nn.Module):
             nn.ConvTranspose2d(64, 32, kernel_size=4, stride=2, padding=1),
             nn.BatchNorm2d(32),
             nn.ReLU(),
-            nn.ConvTranspose2d(32, 3, kernel_size=4, stride=2, padding=1),
-            nn.Tanh()
+            nn.ConvTranspose2d(32, 4, kernel_size=4, stride=2, padding=1),
+            nn.Sigmoid()
         )
         
         self.frame_generator = nn.Linear(hidden_size, max_frames * hidden_size)
@@ -78,10 +112,13 @@ class TextToAnimationCNN(nn.Module):
         frame_features = self.frame_generator(hidden.squeeze(0))
         frame_features = frame_features.view(-1, self.max_frames, self.hidden_size)
         
-        frames = []
-        for i in range(self.max_frames):
-            frame = self.conv_transpose(frame_features[:, i, :].unsqueeze(-1).unsqueeze(-1))
-            frames.append(frame)
+        base_frame = self.conv_transpose(frame_features[:, 0, :].unsqueeze(-1).unsqueeze(-1))
+        
+        frames = [base_frame]
+        for i in range(1, self.max_frames):
+            delta = self.conv_transpose(frame_features[:, i, :].unsqueeze(-1).unsqueeze(-1))
+            new_frame = torch.clamp(frames[-1] + delta, 0, 1)
+            frames.append(new_frame)
         
         return torch.stack(frames, dim=1)
 
@@ -95,9 +132,9 @@ def train_model(model, train_loader, num_epochs, device, model_path):
         total_loss = 0
         batch_count = len(train_loader)
         print(f"\nÉpoca [{epoch+1}/{num_epochs}]")
-        for i, (batch_frames, batch_labels) in enumerate(train_loader):
+        for i, (batch_frames, batch_attributes, batch_descriptions) in enumerate(train_loader):
             batch_frames = batch_frames.to(device)
-            text_indices = torch.tensor([hash(label) % 1000 for label in batch_labels]).to(device)
+            text_indices = torch.tensor([hash(" ".join(attr) + desc) % 1000 for attr, desc in zip(batch_attributes, batch_descriptions)]).to(device)
             
             optimizer.zero_grad()
             outputs = model(text_indices)
@@ -133,8 +170,8 @@ def save_animation(frames, output_path):
     output_path = Path(output_path)
     output_path.mkdir(parents=True, exist_ok=True)
     for i, frame in enumerate(frames):
-        frame = ((frame * 0.5 + 0.5) * 255).astype(np.uint8).transpose(1, 2, 0)
-        img = Image.fromarray(frame)
+        frame = (frame * 255).astype(np.uint8).transpose(1, 2, 0)
+        img = Image.fromarray(frame, 'RGBA')
         img.save(output_path / f"frame_{i:04d}.png")
     print(f"Animación guardada en: {output_path}")
 
@@ -143,52 +180,40 @@ def main():
     parser.add_argument("--train", action="store_true", help="Entrenar el modelo")
     parser.add_argument("--generate", action="store_true", help="Generar una animación")
     parser.add_argument("--text", type=str, help="Texto para generar la animación")
-    parser.add_argument("--output", type=str, default="output_animation", help="Carpeta de salida para la animación")
-    parser.add_argument("--model_path", type=str, default="model", help="Ruta base para guardar/cargar el modelo")
-    parser.add_argument("--data_dir", type=str, default="processed_frames", help="Directorio con los frames procesados")
-    parser.add_argument("--csv_file", type=str, default="dataset.csv", help="Archivo CSV con los datos de entrenamiento")
+    parser.add_argument("--output", type=str, default=r"C:\\Users\\camlo\\Desktop\\intento\\animacion", help="Directorio de salida para la animación")
+    parser.add_argument("--model_path", type=str, default=r"C:\\Users\\camlo\\Desktop\\intento", help="Ruta base para guardar/cargar el modelo")
+    parser.add_argument("--data_dir", type=str, default=r"C:\\Users\\camlo\\Desktop\\intento\\animacion", help="Directorio con los frames procesados")
     parser.add_argument("--epochs", type=int, default=50, help="Número de épocas para entrenar")
     args = parser.parse_args()
 
-    print("Iniciando el script...")
-    print(f"Modo: {'Entrenamiento' if args.train else 'Generación'}")
-
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Usando dispositivo: {device}")
     
     max_frames = 60
     frame_size = 64
     
-    print("Inicializando el modelo...")
     model = TextToAnimationCNN(text_embed_size=100, hidden_size=256, max_frames=max_frames, frame_size=frame_size).to(device)
-    print("Modelo inicializado.")
 
     if args.train:
-        print(f"Cargando datos desde {args.data_dir} y {args.csv_file}...")
         transform = transforms.Compose([
             transforms.Resize((frame_size, frame_size)),
             transforms.ToTensor(),
-            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
         ])
         
         dataset = PixelArtDataset(root_dir=args.data_dir, 
-                                  csv_file=args.csv_file, 
                                   transform=transform, 
                                   max_frames=max_frames)
-        print(f"Dataset cargado. Tamaño del dataset: {len(dataset)}")
         
-        dataloader = DataLoader(dataset, batch_size=1, shuffle=True)
-        print("DataLoader creado. Iniciando entrenamiento...")
+        print_dataset_info(dataset)
+        
+        dataloader = DataLoader(dataset, batch_size=8, shuffle=True)
         
         train_model(model, dataloader, num_epochs=args.epochs, device=device, model_path=args.model_path)
     elif args.generate:
         if not os.path.exists(f"{args.model_path}_final.pth"):
             print(f"Error: No se encontró el modelo en {args.model_path}_final.pth")
-            print("Por favor, entrena el modelo primero usando el argumento --train")
             return
         
         model.load_state_dict(torch.load(f"{args.model_path}_final.pth"))
-        print(f"Modelo cargado desde {args.model_path}_final.pth")
 
         if args.text:
             text = args.text
@@ -199,8 +224,6 @@ def main():
         save_animation(new_animation, args.output)
     else:
         print("Por favor, especifica --train para entrenar el modelo o --generate para generar una animación.")
-
-    print("Script finalizado.")
 
 if __name__ == "__main__":
     main()
